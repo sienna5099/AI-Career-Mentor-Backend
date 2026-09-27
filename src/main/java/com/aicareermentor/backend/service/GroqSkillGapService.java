@@ -1,0 +1,791 @@
+package com.aicareermentor.backend.service;
+
+import com.aicareermentor.backend.dto.SkillGapAnalysisResponse;
+import com.aicareermentor.backend.dto.SkillGapAnalyzeRequest;
+import com.aicareermentor.backend.dto.RoadmapGenerationResponse;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.core.JacksonException;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Service
+public class GroqSkillGapService {
+
+    private final RestClient restClient;
+    private final ObjectMapper objectMapper;
+
+    @Value("${groq.api.url}")
+    private String groqApiUrl;
+
+    @Value("${groq.api.key}")
+    private String groqApiKey;
+
+    @Value("${groq.model}")
+    private String groqModel;
+
+    public GroqSkillGapService(ObjectMapper objectMapper) {
+        this.restClient = RestClient.builder().build();
+        this.objectMapper = objectMapper;
+    }
+
+    public SkillGapAnalysisResponse analyze(
+            String careerName,
+            List<String> requiredSkills,
+            SkillGapAnalyzeRequest request) {
+
+        if (groqApiKey == null || groqApiKey.isBlank()) {
+            throw new IllegalStateException(
+                    "GROQ_API_KEY is not configured. Check your .env file."
+            );
+        }
+
+        String userSkillsText = buildUserSkillsText(request.skills());
+
+        String requiredSkillsText =
+                String.join(", ", requiredSkills);
+
+        String resumeContext = request.resumeContext();
+
+        if (resumeContext == null || resumeContext.isBlank()) {
+            resumeContext =
+                    "No additional resume or profile information was provided.";
+        }
+
+        int requiredSkillCount = requiredSkills.size();
+
+        String systemPrompt = """
+                You are an AI Career Mentor performing a personalized
+                Skill Gap Analysis.
+
+                Analyze the user's current skills against the skills
+                required for their selected career.
+
+                IMPORTANT RULES:
+
+                1. Analyze the selected career only.
+                2. Current skill levels are percentages from 0 to 100.
+                3. Required levels should represent a realistic proficiency
+                   needed for the selected career.
+                4. Calculate gap as requiredLevel - currentLevel.
+                5. Never return a negative gap.
+                6. Use only HIGH, MEDIUM, or LOW as priority.
+                7. Give practical learning recommendations.
+                8. Recommendations should be suitable for a student or
+                   early-career developer.
+                9. Do not invent user experience, projects, certifications,
+                   education, or achievements.
+                10. Use the resume/profile context only as supporting
+                    information.
+                11. Return one skill analysis for every required career skill.
+                    The "skills" array MUST contain exactly one entry per
+                    required skill listed below - never fewer, never more.
+                12. Return only valid structured JSON.
+                """;
+
+        String userPrompt = """
+                Perform a personalized skill gap analysis.
+
+                TARGET CAREER:
+                %s
+
+                REQUIRED CAREER SKILLS (%d total - the "skills" array in your
+                response MUST contain exactly %d entries, one for each of
+                these, in this order):
+                %s
+
+                USER'S CURRENT SKILL LEVELS:
+                %s
+
+                RESUME / PROFILE CONTEXT:
+                %s
+
+                For every required skill, provide:
+
+                - skillName
+                - currentLevel
+                - requiredLevel
+                - gap
+                - priority
+                - reason
+                - recommendations
+
+                Give 3 to 5 practical recommendations for each skill.
+
+                Recommendations can include:
+                - topics to study
+                - practical exercises
+                - projects to build
+                - concepts to practice
+                - certifications when genuinely relevant
+
+                Do not invent course URLs.
+
+                Also provide:
+                - career
+                - summary
+                - overallReadiness
+                - nextSteps
+                """.formatted(
+                careerName,
+                requiredSkillCount,
+                requiredSkillCount,
+                requiredSkillsText,
+                userSkillsText,
+                resumeContext
+        );
+
+        Map<String, Object> requestBody = new HashMap<>();
+
+        requestBody.put("model", groqModel);
+
+        requestBody.put(
+                "messages",
+                List.of(
+                        Map.of(
+                                "role",
+                                "system",
+                                "content",
+                                systemPrompt
+                        ),
+                        Map.of(
+                                "role",
+                                "user",
+                                "content",
+                                userPrompt
+                        )
+                )
+        );
+
+        requestBody.put("temperature", 0.2);
+
+        requestBody.put(
+                "max_completion_tokens",
+                4000
+        );
+
+        requestBody.put(
+                "response_format",
+                buildResponseFormat(requiredSkillCount)
+        );
+
+        IllegalStateException lastFailure = null;
+        int maxAttempts = 3;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return callGroqForAnalysis(requestBody, requiredSkillCount);
+            } catch (IllegalStateException e) {
+                lastFailure = e;
+
+                boolean schemaMismatch = e.getMessage() != null
+                        && e.getMessage().contains("json_validate_failed");
+
+                boolean rateLimited = e.getMessage() != null
+                        && (e.getMessage().contains("rate_limit_exceeded")
+                                || e.getMessage().contains("429"));
+
+                boolean retryable = schemaMismatch || rateLimited;
+
+                if (!retryable || attempt == maxAttempts) {
+                    throw e;
+                }
+
+                if (rateLimited) {
+                    // Groq's TPM window is per-minute - a short pause lets
+                    // it reset instead of failing immediately like a reload would.
+                    try {
+                        Thread.sleep(12000);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw e;
+                    }
+                }
+            }
+        }
+
+        throw lastFailure;
+    }
+
+    private SkillGapAnalysisResponse callGroqForAnalysis(
+            Map<String, Object> requestBody,
+            int requiredSkillCount) {
+
+        try {
+
+            JsonNode response = restClient
+                    .post()
+                    .uri(groqApiUrl)
+                    .header(
+                            HttpHeaders.AUTHORIZATION,
+                            "Bearer " + groqApiKey
+                    )
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(requestBody)
+                    .retrieve()
+                    .body(JsonNode.class);
+
+            if (response == null) {
+                throw new IllegalStateException(
+                        "Groq returned an empty response."
+                );
+            }
+
+            JsonNode contentNode = response
+                    .path("choices")
+                    .path(0)
+                    .path("message")
+                    .path("content");
+
+            if (contentNode.isMissingNode()
+                    || contentNode.isNull()) {
+
+                throw new IllegalStateException(
+                        "Groq response did not contain analysis content."
+                );
+            }
+
+            String content = contentNode.asText();
+
+            if (content == null || content.isBlank()) {
+                throw new IllegalStateException(
+                        "Groq returned empty analysis content."
+                );
+            }
+
+            SkillGapAnalysisResponse analysis = objectMapper.readValue(
+                    content,
+                    SkillGapAnalysisResponse.class
+            );
+
+            if (analysis.skills() == null
+                    || analysis.skills().size() != requiredSkillCount) {
+
+                throw new IllegalStateException(
+                        "Groq returned "
+                                + (analysis.skills() == null
+                                        ? 0
+                                        : analysis.skills().size())
+                                + " skill entries but "
+                                + requiredSkillCount
+                                + " were required. Please try again."
+                );
+            }
+
+            return analysis;
+
+        } catch (RestClientResponseException e) {
+
+            throw new IllegalStateException(
+                    "Groq API request failed. HTTP status: "
+                            + e.getStatusCode()
+                            + ". Response: "
+                            + e.getResponseBodyAsString(),
+                    e
+            );
+
+        } catch (JacksonException e) {
+
+            throw new IllegalStateException(
+                    "Could not parse the structured response returned by Groq.",
+                    e
+            );
+        }
+    }
+
+    private String buildUserSkillsText(
+            List<SkillGapAnalyzeRequest.SkillInput> skills) {
+
+        if (skills == null || skills.isEmpty()) {
+            return "No current skill levels were provided.";
+        }
+
+        List<String> result = new ArrayList<>();
+
+        for (SkillGapAnalyzeRequest.SkillInput skill : skills) {
+
+            result.add(
+                    skill.name()
+                            + ": "
+                            + skill.value()
+                            + "%"
+            );
+        }
+
+        return String.join(", ", result);
+    }
+
+    private Map<String, Object> buildResponseFormat(int requiredSkillCount) {
+
+        Map<String, Object> skillProperties =
+                new HashMap<>();
+
+        skillProperties.put(
+                "skillName",
+                Map.of("type", "string")
+        );
+
+        skillProperties.put(
+                "currentLevel",
+                Map.of("type", "integer")
+        );
+
+        skillProperties.put(
+                "requiredLevel",
+                Map.of("type", "integer")
+        );
+
+        skillProperties.put(
+                "gap",
+                Map.of("type", "integer")
+        );
+
+        skillProperties.put(
+                "priority",
+                Map.of(
+                        "type",
+                        "string",
+                        "enum",
+                        List.of(
+                                "HIGH",
+                                "MEDIUM",
+                                "LOW"
+                        )
+                )
+        );
+
+        skillProperties.put(
+                "reason",
+                Map.of("type", "string")
+        );
+
+        skillProperties.put(
+                "recommendations",
+                Map.of(
+                        "type",
+                        "array",
+                        "items",
+                        Map.of("type", "string")
+                )
+        );
+
+        Map<String, Object> skillSchema =
+                new HashMap<>();
+
+        skillSchema.put(
+                "type",
+                "object"
+        );
+
+        skillSchema.put(
+                "additionalProperties",
+                false
+        );
+
+        skillSchema.put(
+                "properties",
+                skillProperties
+        );
+
+        skillSchema.put(
+                "required",
+                List.of(
+                        "skillName",
+                        "currentLevel",
+                        "requiredLevel",
+                        "gap",
+                        "priority",
+                        "reason",
+                        "recommendations"
+                )
+        );
+
+        Map<String, Object> rootProperties =
+                new HashMap<>();
+
+        rootProperties.put(
+                "career",
+                Map.of("type", "string")
+        );
+
+        rootProperties.put(
+                "summary",
+                Map.of("type", "string")
+        );
+
+        rootProperties.put(
+                "overallReadiness",
+                Map.of("type", "integer")
+        );
+
+        // NOTE: minItems / maxItems pin the array length to the exact
+        // number of required career skills, so the model can no longer
+        // pass schema validation while returning a partial list.
+        rootProperties.put(
+                "skills",
+                Map.of(
+                        "type",
+                        "array",
+                        "items",
+                        skillSchema,
+                        "minItems",
+                        requiredSkillCount,
+                        "maxItems",
+                        requiredSkillCount
+                )
+        );
+
+        rootProperties.put(
+                "nextSteps",
+                Map.of(
+                        "type",
+                        "array",
+                        "items",
+                        Map.of("type", "string")
+                )
+        );
+
+        Map<String, Object> rootSchema =
+                new HashMap<>();
+
+        rootSchema.put(
+                "type",
+                "object"
+        );
+
+        rootSchema.put(
+                "additionalProperties",
+                false
+        );
+
+        rootSchema.put(
+                "properties",
+                rootProperties
+        );
+
+        rootSchema.put(
+                "required",
+                List.of(
+                        "career",
+                        "summary",
+                        "overallReadiness",
+                        "skills",
+                        "nextSteps"
+                )
+        );
+
+        Map<String, Object> jsonSchema =
+                new HashMap<>();
+
+        jsonSchema.put(
+                "name",
+                "skill_gap_analysis"
+        );
+
+        jsonSchema.put(
+                "strict",
+                true
+        );
+
+        jsonSchema.put(
+                "schema",
+                rootSchema
+        );
+
+        return Map.of(
+                "type",
+                "json_schema",
+                "json_schema",
+                jsonSchema
+        );
+    }
+
+    public RoadmapGenerationResponse generateRoadmap(
+        String careerName,
+        SkillGapAnalysisResponse analysis,
+        String resumeContext) {
+
+    if (groqApiKey == null || groqApiKey.isBlank()) {
+        throw new IllegalStateException(
+                "GROQ_API_KEY is not configured."
+        );
+    }
+
+    String context =
+            resumeContext == null || resumeContext.isBlank()
+                    ? "No additional resume or profile information was provided."
+                    : resumeContext;
+
+    String systemPrompt = """
+            You are an AI Career Mentor creating a highly personalized
+            career roadmap.
+
+            Build the roadmap ONLY from the user's actual skill-gap analysis,
+            selected career, and available profile context.
+
+            IMPORTANT RULES:
+
+            1. The roadmap must be personalized to this specific user.
+            2. Prioritize the user's largest and most important skill gaps.
+            3. Order the steps logically from foundational improvement
+               toward practical application.
+            4. Do not create generic steps that are unrelated to the
+               user's skill gaps.
+            5. Include practical learning and practice activities.
+            6. Include a project step when it is useful for applying
+               the user's identified skills.
+            7. The number of steps must depend on the user's needs.
+            8. Do not force a fixed number of steps.
+            9. Do not invent user experience, achievements, certifications,
+               or completed projects.
+            10. Keep the roadmap realistic for a student or early-career
+                learner.
+            11. Return only valid structured JSON.
+            """;
+
+    String userPrompt = """
+            Create a personalized career roadmap.
+
+            TARGET CAREER:
+            %s
+
+            SKILL GAP ANALYSIS:
+            %s
+
+            RESUME / PROFILE CONTEXT:
+            %s
+
+            For every roadmap step provide:
+
+            - title
+            - description
+            - type
+            - skillName
+            - recommendations
+
+            The type should describe the purpose of the step, such as:
+            SKILL_IMPROVEMENT
+            PRACTICE
+            PROJECT
+            PORTFOLIO
+
+            The roadmap should move logically from the user's
+            highest-priority gaps toward practical career readiness.
+
+            Recommendations should contain concrete actions the user
+            can actually perform.
+            """.formatted(
+            careerName,
+            analysis,
+            context
+    );
+
+    Map<String, Object> requestBody = new HashMap<>();
+
+    requestBody.put("model", groqModel);
+
+    requestBody.put(
+            "messages",
+            List.of(
+                    Map.of(
+                            "role",
+                            "system",
+                            "content",
+                            systemPrompt
+                    ),
+                    Map.of(
+                            "role",
+                            "user",
+                            "content",
+                            userPrompt
+                    )
+            )
+    );
+
+    requestBody.put("temperature", 0.3);
+
+    requestBody.put(
+            "max_completion_tokens",
+            3000
+    );
+
+    requestBody.put(
+            "response_format",
+            buildRoadmapResponseFormat()
+    );
+
+    try {
+
+        JsonNode response = restClient
+                .post()
+                .uri(groqApiUrl)
+                .header(
+                        HttpHeaders.AUTHORIZATION,
+                        "Bearer " + groqApiKey
+                )
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(requestBody)
+                .retrieve()
+                .body(JsonNode.class);
+
+        if (response == null) {
+            throw new IllegalStateException(
+                    "Groq returned an empty roadmap response."
+            );
+        }
+
+        JsonNode contentNode = response
+                .path("choices")
+                .path(0)
+                .path("message")
+                .path("content");
+
+        if (contentNode.isMissingNode()
+                || contentNode.isNull()) {
+
+            throw new IllegalStateException(
+                    "Groq response did not contain roadmap content."
+            );
+        }
+
+        String content = contentNode.asText();
+
+        if (content == null || content.isBlank()) {
+            throw new IllegalStateException(
+                    "Groq returned empty roadmap content."
+            );
+        }
+
+        return objectMapper.readValue(
+                content,
+                RoadmapGenerationResponse.class
+        );
+
+    } catch (RestClientResponseException e) {
+
+        throw new IllegalStateException(
+                "Groq roadmap request failed. HTTP status: "
+                        + e.getStatusCode()
+                        + ". Response: "
+                        + e.getResponseBodyAsString(),
+                e
+        );
+
+    } catch (JacksonException e) {
+
+        throw new IllegalStateException(
+                "Could not parse the structured roadmap returned by Groq.",
+                e
+        );
+        }
+        }
+
+    private Map<String, Object> buildRoadmapResponseFormat() {
+
+    Map<String, Object> stepProperties = new HashMap<>();
+
+    stepProperties.put(
+            "title",
+            Map.of("type", "string")
+    );
+
+    stepProperties.put(
+            "description",
+            Map.of("type", "string")
+    );
+
+    stepProperties.put(
+            "type",
+            Map.of("type", "string")
+    );
+
+    stepProperties.put(
+            "skillName",
+            Map.of("type", "string")
+    );
+
+    stepProperties.put(
+            "recommendations",
+            Map.of("type", "string")
+    );
+
+    Map<String, Object> stepSchema = new HashMap<>();
+
+    stepSchema.put("type", "object");
+    stepSchema.put("properties", stepProperties);
+
+    stepSchema.put(
+            "required",
+            List.of(
+                    "title",
+                    "description",
+                    "type",
+                    "skillName",
+                    "recommendations"
+            )
+    );
+
+    stepSchema.put("additionalProperties", false);
+
+    Map<String, Object> rootProperties = new HashMap<>();
+
+    rootProperties.put(
+            "title",
+            Map.of("type", "string")
+    );
+
+    rootProperties.put(
+            "summary",
+            Map.of("type", "string")
+    );
+
+    rootProperties.put(
+            "steps",
+            Map.of(
+                    "type",
+                    "array",
+                    "items",
+                    stepSchema
+            )
+    );
+
+    Map<String, Object> schema = new HashMap<>();
+
+    schema.put("type", "object");
+    schema.put("properties", rootProperties);
+
+    schema.put(
+            "required",
+            List.of(
+                    "title",
+                    "summary",
+                    "steps"
+            )
+    );
+
+    schema.put("additionalProperties", false);
+
+    return Map.of(
+            "type",
+            "json_schema",
+            "json_schema",
+            Map.of(
+                    "name",
+                    "career_roadmap",
+                    "strict",
+                    true,
+                    "schema",
+                    schema
+            )
+    );
+}
+}
